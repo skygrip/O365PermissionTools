@@ -62,14 +62,15 @@ Get-Mailbox -ResultSize Unlimited | Get-All-Mailbox-Permissions -AsObject | Out-
 
 ## 🔍 Features & Audited Data Points
 
-- **Mailbox Core Settings & Quotas**: UPN, RecipientTypeDetails, hidden status, forwarding addresses, storage usage, and quota thresholds.
+- **Mailbox Core Settings & Quotas**: UPN, Entra ID Object GUID (`ExternalDirectoryObjectId`), RecipientTypeDetails, hidden status, sharing policy (`SharingPolicy`), secondary email aliases (`EmailAddresses`), forwarding addresses, storage usage, and quota thresholds.
 - **Online Archive**: Archive status, state, auto-expanding setting, and archive storage usage.
 - **Litigation & Legal Holds**: Litigation hold parameters, InPlaceHolds GUID list, delay hold status, retention policies, and single item recovery.
 - **Recoverable Items Audit**: Deep inspection of `DiscoveryHolds`, `SubstrateHolds`, and `Purges` subfolders with item counts and date ranges to detect active/stale holds.
+- **Mailbox Auditing & Audit Bypass**: Admin/Delegate/Owner audit logging configuration and **Audit Bypass check** (`Get-MailboxAuditBypassAssociation`).
 - **Delegation Permissions**: FullAccess (with AutoMapping), SendAs, SendOnBehalfTo (with full identity resolution for MailUser, external, and orphaned accounts).
 - **Folder Permissions**: Walks all subfolders to report folder-level access rights.
 - **Inbox Rules**: Enumerates all rules including **hidden rules** (`-IncludeHidden`) to catch BEC persistence mechanisms.
-- **Client Access Settings (CAS)**: Status of OWA, MAPI, EWS, IMAP, POP, ActiveSync, and SMTP Auth protocols.
+- **Client Access Settings (CAS)**: Status of OWA, MAPI, EWS, IMAP, POP, ActiveSync, Outlook Mobile, Mac Outlook, OWA for Devices, ECP, and SMTP Auth protocols.
 - **Calendar Settings**: Calendar processing configuration and resolved resource delegates.
 - **Active Mobile Devices**: Associated ActiveSync device statistics.
 - **Outlook Add-ins**: Native Outlook web/COM add-ins installed on the mailbox.

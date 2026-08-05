@@ -88,10 +88,8 @@ function Get-All-Mailbox-Permissions {
     }
 
     process {
-        # Use a generic list rather than a plain array so we can call AddRange() when
-        # appending batch results from Get-EXOMailboxFolderPermission. Folder permissions
-        # are collected across all folders and merged into a single flat list for output.
-        $AllFolderPermissions = [System.Collections.Generic.List[psobject]]::new()
+        # Use a generic list to collect folder permissions across all user folders
+        $AllFolderPermissions = [System.Collections.Generic.List[object]]::new()
 
         # -----------------------------------------------------------------------
         # Phase 1: Data Gathering
@@ -115,11 +113,16 @@ function Get-All-Mailbox-Permissions {
             DelayHoldApplied, ComplianceTagHoldApplied, SingleItemRecoveryEnabled, `
             RetentionPolicy, RetentionHoldEnabled, ElcProcessingDisabled, `
             RecipientTypeDetails, HiddenFromAddressListsEnabled, ArchiveStatus, ArchiveState, AutoExpandingArchiveEnabled, `
-            IssueWarningQuota, ProhibitSendQuota, ProhibitSendReceiveQuota, GrantSendOnBehalfTo
+            IssueWarningQuota, ProhibitSendQuota, ProhibitSendReceiveQuota, GrantSendOnBehalfTo, `
+            SharingPolicy, EmailAddresses, ExternalDirectoryObjectId
 
         # CAS settings control which client protocols (OWA, MAPI, EWS, IMAP, POP, ActiveSync,
-        # SMTP Auth) are enabled. Disabling unused protocols reduces attack surface.
+        # SMTP Auth, Outlook Mobile, Mac Outlook) are enabled. Disabling unused protocols reduces attack surface.
         $MBXCAS = Get-CASMailbox -Identity $Mailbox
+
+        # Check if the mailbox is set to bypass mailbox audit logging. If AuditBypassEnabled is $true,
+        # all actions by this account are silently excluded from Exchange audit logs.
+        $MBXAuditBypass = Get-MailboxAuditBypassAssociation -Identity $Mailbox -ErrorAction SilentlyContinue
 
         # -IncludeHidden surfaces rules created by malicious actors or legacy tools that
         # set the hidden flag to avoid appearing in the standard Outlook UI. Hidden rules
@@ -215,8 +218,37 @@ function Get-All-Mailbox-Permissions {
         # SilentlyContinue on both of these because resource/shared mailboxes and certain
         # service accounts may not support mobile device partnerships or the add-ins endpoint,
         # and we don't want a non-critical failure to abort the entire audit.
-        $MBXMobileDevices = Get-MobileDeviceStatistics -Mailbox $Mailbox -ErrorAction SilentlyContinue
-        $MBXAddins = Get-App -Mailbox $Mailbox -ErrorAction SilentlyContinue
+        # Retrieve Outlook Add-ins (Native Exchange Online apps) and correlate against known default Microsoft AppIDs
+        $knownDefaultAppIds = @(
+            '9fd38622-d9b4-4401-b1b9-1ce14c5e435a', # Viva Insights
+            'fe93bfe1-7947-460a-a5e0-7a5906b51360', # Viva Insights
+            'c88ddf0b-47e0-47b2-a42e-efc7d779a528', # Viva Insights / Analytics
+            '39352e85-5b4d-453d-82d8-fd2b7a95632a', # Viva Insights
+            'f60b8ac7-c3e3-4e42-8dad-e4e1fea59ff7', # Action Items
+            '2643a6d4-8d48-43da-91ef-fbc3e9b110f0', # Action Items
+            '7a774f0c-7a6f-11e0-85ad-07fb4824019b', # Bing Maps
+            'e51b1a0e-030e-4631-b2e5-7e1088d8b67f', # Bing Maps
+            'a216ceed-7791-4635-a752-5a4ac0a5eb93', # My Templates
+            'bc172159-20ff-4e78-be75-d227b9c9f6d6', # My Templates
+            'd39dee0e-fdc3-4015-af8d-94d4d49294b3', # Unsubscribe
+            'afde34e6-58a4-4122-8a52-ef402180a878', # Polls
+            '6b47614e-0125-454b-9f76-bd5aef85ac7b', # Send to OneNote
+            '1b008d51-9252-47d9-b003-7a9d06b5278c'  # Suggested Meetings
+        )
+
+        $rawAddins = Get-App -Mailbox $Mailbox -ErrorAction SilentlyContinue
+        $MBXAddins = if ($rawAddins) {
+            foreach ($app in $rawAddins) {
+                [PSCustomObject]@{
+                    DisplayName         = $app.DisplayName
+                    AppId               = $app.AppId
+                    Enabled             = $app.Enabled
+                    IN_HARDCODEDLIST    = ($app.AppId -in $knownDefaultAppIds)
+                    AppVersion          = $app.AppVersion
+                    DefaultStateForUser = $app.DefaultStateForUser
+                }
+            }
+        } else { $null }
 
         # OAuth permission grants represent third-party apps that have been granted access
         # to the mailbox by the user (e.g. via browser consent prompts). These are separate
@@ -257,33 +289,38 @@ function Get-All-Mailbox-Permissions {
             Write-Verbose "Microsoft.Graph module is not connected. Skipping OAuth app retrieval."
         }
 
-        # Retrieve folder list for permission enumeration. We exclude the virtual
-        # "/Top of Information Store" root node because it is a container artifact
-        # and does not represent a real addressable folder.
-        $MBXFolders = Get-EXOMailboxFolderStatistics $Mailbox | Select-Object FolderPath | Where-Object { ($_.FolderPath -notlike "/Top of Information Store") }
+        # Retrieve a list of all user-visible (IPM) mailbox subfolders. We filter specifically for
+        # "/Top of Information Store/*" because non-IPM system folders (Recoverable Items, Audits,
+        # Calendar Logging, DiscoveryHolds, Purges, etc.) do not support Get-EXOMailboxFolderPermission
+        # and throw 'ManagementObjectNotFoundException' if queried.
+        $MBXFolders = Get-EXOMailboxFolderStatistics $Mailbox | Where-Object { $_.FolderPath -like "/Top of Information Store/*" } | Select-Object FolderPath
 
         # The mailbox root-level permissions (no folder path qualifier) are separate from
         # individual subfolder permissions and must be retrieved with a standalone call.
-        # AddRange() requires IEnumerable; [object[]]@(...) ensures that even a single
-        # returned object is wrapped in an array and not unwrapped by PowerShell's
-        # automatic enumeration, which would cause AddRange() to throw.
-        $topLevelPerms = Get-EXOMailboxFolderPermission $Mailbox | Where-Object { ($_.AccessRights -notlike "None") } | Where-Object { ($_.User -notlike "NT AUTHORITY\SELF") }
-        if ($topLevelPerms) { $AllFolderPermissions.AddRange([object[]]@($topLevelPerms)) }
+        $topLevelPerms = Get-EXOMailboxFolderPermission $Mailbox -ErrorAction SilentlyContinue | Where-Object { ($_.AccessRights -notlike "None") } | Where-Object { ($_.User -notlike "NT AUTHORITY\SELF") }
+        if ($topLevelPerms) {
+            foreach ($perm in $topLevelPerms) {
+                $AllFolderPermissions.Add($perm)
+            }
+        }
 
-        # Walk every subfolder and collect non-default, non-self permissions.
+        # Walk every user subfolder and collect non-default, non-self permissions.
         # FolderPath from Get-EXOMailboxFolderStatistics uses forward-slash notation
-        # (e.g. /Inbox/Subfolder); the Exchange folder identity format requires
+        # (e.g. /Top of Information Store/Inbox/Subfolder); the Exchange folder identity format requires
         # backslash notation prefixed with the SMTP address (e.g. user@domain.com:\Inbox\Subfolder).
         foreach ($MBXFolder in $MBXFolders) {
             try {
                 $relativePath = $MBXFolder.FolderPath -replace '^/Top of Information Store', '' -replace '/', '\'
-                $folder = if ($relativePath) { $MBX.PrimarySmtpAddress + ":" + $relativePath } else { $MBX.PrimarySmtpAddress }
+                $folder = $MBX.PrimarySmtpAddress + ":" + $relativePath
                 $folderpermissions = Get-EXOMailboxFolderPermission -Identity $folder -ErrorAction Stop | Where-Object { ($_.AccessRights -notlike "None") } | Where-Object { ($_.User -notlike "NT AUTHORITY\SELF") }
-                if ($folderpermissions) { $AllFolderPermissions.AddRange([object[]]@($folderpermissions)) }
+                if ($folderpermissions) {
+                    foreach ($perm in $folderpermissions) {
+                        $AllFolderPermissions.Add($perm)
+                    }
+                }
             }
             catch {
-                # Some system folders (e.g. Audits, Sync Issues) may reject permission queries.
-                # Log a warning and continue rather than aborting the entire folder walk.
+                # Log a warning for any subfolder permission query failure and continue
                 Write-Warning "Failed to read permissions on folder: $folder - $($_.Exception.Message)"
                 continue
             }
@@ -298,8 +335,11 @@ function Get-All-Mailbox-Permissions {
         $MailboxReport = [PSCustomObject]@{
             Mailbox                     = $MBX.PrimarySmtpAddress
             UserPrincipalName           = $MBX.UserPrincipalName
+            ExternalDirectoryObjectId   = $MBX.ExternalDirectoryObjectId  # Entra ID User Object GUID for log correlation
             RecipientTypeDetails        = $MBX.RecipientTypeDetails  # e.g. UserMailbox, SharedMailbox, RoomMailbox
             HiddenFromAddressLists      = $MBX.HiddenFromAddressListsEnabled
+            SharingPolicy               = $MBX.SharingPolicy        # External calendar/contact sharing policy applied
+            EmailAddresses              = $MBX.EmailAddresses       # All primary and secondary SMTP aliases assigned
             ForwardingSmtpAddress       = $MBX.ForwardingSmtpAddress   # SMTP forwarding set directly on the mailbox
             ForwardingAddress           = $MBX.ForwardingAddress        # Forwarding to an internal recipient object
             DeliverToMailboxAndForward  = $MBX.DeliverToMailboxAndForward  # $true = keep a copy + forward; $false = forward only
@@ -349,13 +389,15 @@ function Get-All-Mailbox-Permissions {
             # AuditEnabled should be $true and DefaultAuditSet should be populated for
             # all modern Exchange Online mailboxes. If AuditEnabled is $false, mailbox
             # activity (admin, delegate, owner actions) is not being logged.
+            # BypassEnabled = $true indicates all actions by this user bypass audit logging.
             AuditSettings               = [PSCustomObject]@{
-                Enabled     = $MBX.AuditEnabled
-                LogAgeLimit = $MBX.AuditLogAgeLimit   # How long audit log entries are retained
-                DefaultSet  = $MBX.DefaultAuditSet     # Which role groups use the tenant-default audit action set
-                Admin       = $MBX.AuditAdmin           # Actions logged when an admin accesses the mailbox
-                Delegate    = $MBX.AuditDelegate         # Actions logged for delegate (e.g. FullAccess) access
-                Owner       = $MBX.AuditOwner            # Actions logged for the mailbox owner themselves
+                Enabled       = $MBX.AuditEnabled
+                BypassEnabled = if ($MBXAuditBypass) { [bool]$MBXAuditBypass.AuditBypassEnabled } else { $false }
+                LogAgeLimit   = $MBX.AuditLogAgeLimit   # How long audit log entries are retained
+                DefaultSet    = $MBX.DefaultAuditSet     # Which role groups use the tenant-default audit action set
+                Admin         = $MBX.AuditAdmin           # Actions logged when an admin accesses the mailbox
+                Delegate      = $MBX.AuditDelegate         # Actions logged for delegate (e.g. FullAccess) access
+                Owner         = $MBX.AuditOwner            # Actions logged for the mailbox owner themselves
             }
 
             ClientAccess                = $MBXCAS           # Full CAS object; contains all protocol enable/disable flags
@@ -389,16 +431,19 @@ function Get-All-Mailbox-Permissions {
         if ($AsObject) {
             Write-Output $MailboxReport
         } else {
-            Write-Output "========== Mailbox Settings & Type ========="
+            Write-Host "========== Mailbox Settings & Type =========" -ForegroundColor Cyan
             Write-Output "Mailbox: $($MailboxReport.Mailbox)"
             Write-Output "UPN: $($MailboxReport.UserPrincipalName)"
+            Write-Output "ExternalDirectoryObjectId: $($MailboxReport.ExternalDirectoryObjectId)"
             Write-Output "RecipientTypeDetails: $($MailboxReport.RecipientTypeDetails)"
             Write-Output "HiddenFromAddressListsEnabled: $($MailboxReport.HiddenFromAddressLists)"
+            Write-Output "SharingPolicy: $($MailboxReport.SharingPolicy)"
+            Write-Output "EmailAddresses: $($MailboxReport.EmailAddresses -join ', ')"
             Write-Output "ForwardingSmtpAddress: $($MailboxReport.ForwardingSmtpAddress)"
             Write-Output "ForwardingAddress: $($MailboxReport.ForwardingAddress)"
             Write-Output "DeliverToMailboxAndForward: $($MailboxReport.DeliverToMailboxAndForward)"
             Write-Output ""
-            Write-Output "========= Mailbox Storage & Quota Statistics ========="
+            Write-Host "========= Mailbox Storage & Quota Statistics =========" -ForegroundColor Cyan
             Write-Output "TotalItemSize: $($MailboxReport.StorageStats.TotalItemSize)"
             Write-Output "ItemCount: $($MailboxReport.StorageStats.ItemCount)"
             Write-Output "TotalDeletedItemSize (Recoverable Items): $($MailboxReport.StorageStats.TotalDeletedItemSize)"
@@ -407,7 +452,7 @@ function Get-All-Mailbox-Permissions {
             Write-Output "ProhibitSendQuota: $($MailboxReport.StorageStats.ProhibitSendQuota)"
             Write-Output "ProhibitSendReceiveQuota: $($MailboxReport.StorageStats.ProhibitSendReceiveQuota)"
             Write-Output ""
-            Write-Output "========= Online Archive Status ========="
+            Write-Host "========= Online Archive Status =========" -ForegroundColor Cyan
             Write-Output "ArchiveStatus: $($MailboxReport.ArchiveStatus)"
             Write-Output "ArchiveState: $($MailboxReport.ArchiveState)"
             Write-Output "AutoExpandingArchiveEnabled: $($MailboxReport.AutoExpandingArchiveEnabled)"
@@ -416,8 +461,8 @@ function Get-All-Mailbox-Permissions {
                 Write-Output "Archive ItemCount: $($MailboxReport.ArchiveStats.ItemCount)"
             }
             Write-Output ""
-            Write-Output "========= Litigation & Legal Hold Settings ========="
-            Write-Output "These settings can be modified using Set-Mailbox"
+            Write-Host "========= Litigation & Legal Hold Settings =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified using Set-Mailbox" -ForegroundColor DarkGray
             Write-Output "LitigationHoldEnabled: $($MailboxReport.LitigationHold.Enabled)"
             Write-Output "LitigationHoldDate: $($MailboxReport.LitigationHold.Date)"
             Write-Output "LitigationHoldOwner: $($MailboxReport.LitigationHold.Owner)"
@@ -430,19 +475,19 @@ function Get-All-Mailbox-Permissions {
             Write-Output "RetentionHoldEnabled: $($MailboxReport.LitigationHold.RetentionHoldEnabled)"
             Write-Output "ElcProcessingDisabled: $($MailboxReport.LitigationHold.ElcProcessingDisabled)"
             Write-Output ""
-            Write-Output "========= Recoverable Items & Active Hold Audit ========="
-            Write-Output "Inspects hidden hold subfolders to verify if items are actively being preserved."
+            Write-Host "========= Recoverable Items & Active Hold Audit =========" -ForegroundColor Cyan
+            Write-Host "Inspects hidden hold subfolders to verify if items are actively being preserved." -ForegroundColor DarkGray
 
             # Flag the mismatch case: LitigationHold is off but hold subfolders have content.
             # This typically means a Purview retention policy or eDiscovery hold is active
             # rather than the classic per-mailbox litigation hold — important for compliance teams.
             if (-not $MailboxReport.LitigationHold.Enabled -and $MailboxReport.HasHoldItems) {
                 Write-Output ""
-                Write-Output "--------------------------------------------------------------------------------"
-                Write-Output "[WARNING] LitigationHoldEnabled is FALSE, but hold subfolder(s) contain items!"
-                Write-Output "This indicates an active/pending Purview Retention Policy, eDiscovery Hold, or"
-                Write-Output "un-synced background policy may be preserving data on this mailbox."
-                Write-Output "--------------------------------------------------------------------------------"
+                Write-Host "--------------------------------------------------------------------------------" -ForegroundColor Yellow
+                Write-Host "[WARNING] LitigationHoldEnabled is FALSE, but hold subfolder(s) contain items!" -ForegroundColor Yellow
+                Write-Host "This indicates an active/pending Purview Retention Policy, eDiscovery Hold, or" -ForegroundColor Yellow
+                Write-Host "un-synced background policy may be preserving data on this mailbox." -ForegroundColor Yellow
+                Write-Host "--------------------------------------------------------------------------------" -ForegroundColor Yellow
                 Write-Output ""
             }
 
@@ -452,17 +497,18 @@ function Get-All-Mailbox-Permissions {
                 Write-Output "No items found in Recoverable Items."
             }
             Write-Output ""
-            Write-Output "========= Mailbox Auditing ========="
-            Write-Output "These settings can be modified using Set-Mailbox"
+            Write-Host "========= Mailbox Auditing =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified using Set-Mailbox" -ForegroundColor DarkGray
             Write-Output "AuditEnabled: $($MailboxReport.AuditSettings.Enabled)"
+            Write-Output "AuditBypassEnabled: $($MailboxReport.AuditSettings.BypassEnabled)"
             Write-Output "AuditLogAgeLimit: $($MailboxReport.AuditSettings.LogAgeLimit)"
             Write-Output "DefaultAuditSet: $($MailboxReport.AuditSettings.DefaultSet -join ', ')"
             Write-Output "AuditAdmin: $($MailboxReport.AuditSettings.Admin -join ', ')"
             Write-Output "AuditDelegate: $($MailboxReport.AuditSettings.Delegate -join ', ')"
             Write-Output "AuditOwner: $($MailboxReport.AuditSettings.Owner -join ', ')"
             Write-Output ""
-            Write-Output "========= Client Access Settings (Protocols) ========="
-            Write-Output "These settings can be modified using Set-CASMailbox"
+            Write-Host "========= Client Access Settings (Protocols) =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified using Set-CASMailbox" -ForegroundColor DarkGray
             if ($MailboxReport.ClientAccess) {
                 Write-Output "ActiveSyncEnabled: $($MailboxReport.ClientAccess.ActiveSyncEnabled)"
                 Write-Output "EwsEnabled: $($MailboxReport.ClientAccess.EwsEnabled)"
@@ -470,65 +516,70 @@ function Get-All-Mailbox-Permissions {
                 Write-Output "PopEnabled: $($MailboxReport.ClientAccess.PopEnabled)"
                 Write-Output "OwaEnabled: $($MailboxReport.ClientAccess.OwaEnabled)"
                 Write-Output "MAPIEnabled: $($MailboxReport.ClientAccess.MAPIEnabled)"
+                Write-Output "OutlookMobileEnabled: $($MailboxReport.ClientAccess.OutlookMobileEnabled)"
+                Write-Output "MacOutlookEnabled: $($MailboxReport.ClientAccess.MacOutlookEnabled)"
+                Write-Output "OWAforDevicesEnabled: $($MailboxReport.ClientAccess.OWAforDevicesEnabled)"
+                Write-Output "ECPEnabled: $($MailboxReport.ClientAccess.ECPEnabled)"
                 Write-Output "SmtpClientAuthenticationDisabled: $($MailboxReport.ClientAccess.SmtpClientAuthenticationDisabled)"
             }
             Write-Output ""
-            Write-Output "========= Calendar Permissions ========="
+            Write-Host "========= Calendar Permissions =========" -ForegroundColor Cyan
             if ($MailboxReport.CalendarProcessing) {
                 Write-Output "ForwardRequestsToDelegates: $($MailboxReport.CalendarProcessing.ForwardRequestsToDelegates)"
             }
             Write-Output "ResourceDelegates"
             if ($MailboxReport.CalendarDelegates) { Write-Output ($MailboxReport.CalendarDelegates | Format-Table Name, DisplayName, RecipientType -Wrap -AutoSize) }
             Write-Output ""
-            Write-Output "========= Send As Permissions ========="
-            Write-Output "These settings can be modified with the following command"
-            Write-Output "#Remove-RecipientPermission -AccessRights SendAs -Identity $($MailboxReport.Mailbox)"
+            Write-Host "========= Send As Permissions =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified with the following command" -ForegroundColor DarkGray
+            Write-Host "#Remove-RecipientPermission -AccessRights SendAs -Identity $($MailboxReport.Mailbox)" -ForegroundColor DarkGray
             if ($MailboxReport.Permissions.SendAs) { Write-Output ($MailboxReport.Permissions.SendAs | Format-Table Identity, Trustee, AccessRights, AccessControlType, Inherited -Wrap -AutoSize) }
             Write-Output ""
-            Write-Output "========= Send On Behalf Permissions ========="
-            Write-Output "These settings can be modified with the following command"
-            Write-Output "#Set-Mailbox $($MailboxReport.Mailbox) -GrantSendOnBehalfTo @{Remove=""USER""}"
+            Write-Host "========= Send On Behalf Permissions =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified with the following command" -ForegroundColor DarkGray
+            Write-Host "#Set-Mailbox $($MailboxReport.Mailbox) -GrantSendOnBehalfTo @{Remove=""USER""}" -ForegroundColor DarkGray
             if ($MailboxReport.Permissions.SendOnBehalf) { Write-Output ($MailboxReport.Permissions.SendOnBehalf | Format-Table Name, DisplayName, RecipientType -Wrap -AutoSize) }
             Write-Output ""
-            Write-Output "========= Mailbox Permissions (Delegation & AutoMapping) ========="
-            Write-Output "These settings can be modified with the following command"
-            Write-Output "#Remove-MailboxPermission $($MailboxReport.Mailbox) -AccessRights FullAccess -InheritanceType All"
+            Write-Host "========= Mailbox Permissions (Delegation & AutoMapping) =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified with the following command" -ForegroundColor DarkGray
+            Write-Host "#Remove-MailboxPermission $($MailboxReport.Mailbox) -AccessRights FullAccess -InheritanceType All" -ForegroundColor DarkGray
             if ($MailboxReport.Permissions.FullAccess) { Write-Output ($MailboxReport.Permissions.FullAccess | Format-Table User, AccessRights, AutoMapping, IsValid -Wrap -AutoSize) }
             Write-Output ""
-            Write-Output "========= Folder Permissions ========="
-            Write-Output "These settings can be modified with the following command"
-            Write-Output "#Remove-MailboxFolderPermission"
+            Write-Host "========= Folder Permissions =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified with the following command" -ForegroundColor DarkGray
+            Write-Host "#Remove-MailboxFolderPermission" -ForegroundColor DarkGray
             if ($MailboxReport.Permissions.Folders.Count -gt 0) { Write-Output ($MailboxReport.Permissions.Folders | Format-Table -Wrap -AutoSize) }
             Write-Output ""
-            Write-Output "========= Inbox Rules (Including Hidden Rules) ========="
-            Write-Output "These settings can be modified with the following command"
-            Write-Output "#Remove-InboxRule"
+            Write-Host "========= Inbox Rules (Including Hidden Rules) =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified with the following command" -ForegroundColor DarkGray
+            Write-Host "#Remove-InboxRule" -ForegroundColor DarkGray
             if ($MailboxReport.InboxRules) { Write-Output ($MailboxReport.InboxRules | Format-Table Name, Enabled, Priority, RuleIdentity, IsHidden -Wrap -AutoSize) }
             Write-Output ""
-            Write-Output "========= Mobile Devices ========="
-            Write-Output "These settings can be modified with the following command"
-            Write-Output "#Remove-MobileDevice"
+            Write-Host "========= Mobile Devices =========" -ForegroundColor Cyan
+            Write-Host "These settings can be modified with the following command" -ForegroundColor DarkGray
+            Write-Host "#Remove-MobileDevice" -ForegroundColor DarkGray
             if ($MailboxReport.MobileDevices) { Write-Output ($MailboxReport.MobileDevices | Format-Table -Wrap -AutoSize) }
             Write-Output ""
-            Write-Output "========= Outlook Add-ins ========="
-            Write-Output "These are native Outlook add-ins installed for the mailbox."
-            Write-Output "These settings can be modified with the following command:"
-            Write-Output "#Remove-App -Mailbox $($MailboxReport.Mailbox) -Identity <AppId>"
-            if ($MailboxReport.OutlookAddins) { Write-Output ($MailboxReport.OutlookAddins | Format-Table DisplayName, AppId, Enabled, AppVersion, DefaultStateForUser -Wrap -AutoSize) }
+            Write-Host "========= Outlook Add-ins =========" -ForegroundColor Cyan
+            Write-Host "These are native Outlook add-ins installed for the mailbox." -ForegroundColor DarkGray
+            Write-Host "IsKnownDefault indicates whether the AppID matches a known standard Microsoft default add-in." -ForegroundColor DarkGray
+            Write-Host "These settings can be modified with the following command:" -ForegroundColor DarkGray
+            Write-Host "#Remove-App -Mailbox $($MailboxReport.Mailbox) -Identity <AppId>" -ForegroundColor DarkGray
+            if ($MailboxReport.OutlookAddins) { Write-Output ($MailboxReport.OutlookAddins | Format-Table DisplayName, AppId, Enabled, IsKnownDefault, AppVersion, DefaultStateForUser -Wrap -AutoSize) }
             Write-Output ""
-            Write-Output "========= OAuth Apps (User Consents) ========="
-            Write-Output "These are Azure AD OAuth permissions consented to by the user."
-            Write-Output "Requires Microsoft.Graph module and Connect-MgGraph."
-            Write-Output "#Revoke-MgUserOauth2PermissionGrant -UserId $($MailboxReport.UserPrincipalName) -OAuth2PermissionGrantId <Id>"
+            Write-Host "========= OAuth Apps (User Consents) =========" -ForegroundColor Cyan
+            Write-Host "These are Azure AD OAuth permissions consented to by the user." -ForegroundColor DarkGray
+            Write-Host "Requires Microsoft.Graph module and Connect-MgGraph." -ForegroundColor DarkGray
+            Write-Host "#Revoke-MgUserOauth2PermissionGrant -UserId $($MailboxReport.UserPrincipalName) -OAuth2PermissionGrantId <Id>" -ForegroundColor DarkGray
             if ($MailboxReport.OAuthApps) {
                 Write-Output ($MailboxReport.OAuthApps | Format-Table AppName, ClientId, Scope, ConsentType, Id -Wrap -AutoSize)
             } else {
                 Write-Output "None found or Microsoft.Graph module is not connected."
             }
             Write-Output ""
-            Write-Output "========= Application Access Policies (Tenant-Wide) ========="
-            Write-Output "These policies restrict or grant OAuth app access to mailboxes based on groups."
-            Write-Output "Note: This lists all tenant policies. You must check if this mailbox is in the PolicyScopeGroupId."
+            Write-Host "========= Application Access Policies (Tenant-Wide) =========" -ForegroundColor Cyan
+            Write-Host "These policies restrict or grant OAuth app access to mailboxes based on groups." -ForegroundColor DarkGray
+            Write-Host "Note: This lists all tenant policies. You must check if this mailbox is in the PolicyScopeGroupId." -ForegroundColor DarkGray
             if ($MailboxReport.ApplicationAccessPolicies.Count -gt 0) {
                 Write-Output ($MailboxReport.ApplicationAccessPolicies | Format-Table AppName, AccessRight, PolicyScopeGroupId, AppId, Description -Wrap -AutoSize)
             } else {
