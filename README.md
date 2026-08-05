@@ -6,18 +6,21 @@ A comprehensive PowerShell auditing tool for Exchange Online mailboxes.
 
 ---
 
-## ⚡ Quick Start (1-Liner)
+## ⚡ Installation
 
-Load the script directly into your current PowerShell session without downloading files or cloning the repo:
+Install as a PowerShell module into your user module path (`$env:PSModulePath`). Once installed, `Get-All-Mailbox-Permissions` is available automatically in any new PowerShell terminal:
 
 ```powershell
-irm https://raw.githubusercontent.com/skygrip/O365PermissionTools/main/Get-All-Mailbox-Permissions.ps1 | iex
+$modDir = "$HOME\Documents\PowerShell\Modules\O365PermissionTools"
+New-Item -ItemType Directory -Path $modDir -Force
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/skygrip/O365PermissionTools/main/Get-All-Mailbox-Permissions.ps1" -OutFile "$modDir\O365PermissionTools.psm1"
 ```
 
-Or download it locally:
+### Manual / Local Loading
+If you clone or download the repository locally, you can dot-source the script in your current session:
 
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/skygrip/O365PermissionTools/main/Get-All-Mailbox-Permissions.ps1" -OutFile "$HOME\Get-All-Mailbox-Permissions.ps1"
+. .\Get-All-Mailbox-Permissions.ps1
 ```
 
 ---
