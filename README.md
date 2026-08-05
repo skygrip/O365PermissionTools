@@ -10,19 +10,25 @@ A comprehensive PowerShell auditing tool for Exchange Online mailboxes.
 
 Install as a PowerShell module into your user module path (`$env:PSModulePath`). Naming the module folder to match the command name enables automatic PowerShell module discovery without requiring manual imports:
 
+### Option A: Direct Download via PowerShell
 ```powershell
-$modDir = "$HOME\Documents\PowerShell\Modules\Get-All-Mailbox-Permissions"
+$modDir = Join-Path ($env:PSModulePath -split ';')[0] "Get-All-Mailbox-Permissions"
 New-Item -ItemType Directory -Path $modDir -Force
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/skygrip/O365PermissionTools/main/Get-All-Mailbox-Permissions.ps1" -OutFile "$modDir\Get-All-Mailbox-Permissions.psm1"
 Unblock-File -Path "$modDir\Get-All-Mailbox-Permissions.psm1"
 ```
 
-### Manual / Local Loading
-If you clone or download the repository locally, you can dot-source the script in your current session:
-
+### Option B: Copy from Local Repository
+If you cloned or downloaded the repository locally, copy the script into your user module path:
 ```powershell
-. .\Get-All-Mailbox-Permissions.ps1
+$modDir = Join-Path ($env:PSModulePath -split ';')[0] "Get-All-Mailbox-Permissions"
+New-Item -ItemType Directory -Path $modDir -Force
+Copy-Item -Path ".\Get-All-Mailbox-Permissions.ps1" -Destination "$modDir\Get-All-Mailbox-Permissions.psm1" -Force
+Unblock-File -Path "$modDir\Get-All-Mailbox-Permissions.psm1"
 ```
+
+> [!NOTE]
+> **Corporate Laptops & OneDrive Redirection**: On enterprise devices where `Documents` is redirected to OneDrive (e.g. `OneDrive - Enterprise\Documents`), the commands above dynamically target your active `$env:PSModulePath` and run `Unblock-File` so Windows permits execution from cloud-synced folders.
 
 ---
 
